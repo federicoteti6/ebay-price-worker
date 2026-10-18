@@ -34,9 +34,15 @@ POST /check
                     "best_offer": 0, "item_url": "...", "deleted": 0 } ] }
 
 GET  /history?source=my-app&item_id=item-10   all past lookups, stats recomputed
+POST /medians { "source": "my-app", "item_ids": ["item-10", "item-11"] }
+                                              latest known median per item, without calling eBay
 POST /listing/501/delete                      exclude a wrong listing
 POST /listing/501/restore                     undo that
 ```
+
+Errors: `401` wrong or missing key, `503` if `PRICING_KEY` is not configured, `400` for invalid JSON,
+missing fields or values out of limits (`source` ≤ 60 chars, `item_id` ≤ 120, `query` ≤ 300,
+`marketplace` shaped like `EBAY_IT`).
 
 `source` is a free label for the calling app and `item_id` is whatever stable id that app uses, so
 several apps can share one service and one database without mixing their history.
@@ -66,9 +72,19 @@ also avoids the "Worker calling another workers.dev Worker" restriction.
 
 - **Check eBay's API License Agreement** before relying on this: it governs how eBay content may be
   stored and for how long. This service keeps lookups in your own D1 database.
-- The shared-key check is a plain string comparison; for anything beyond a personal project, use a
-  constant-time comparison or a service binding.
+- The shared key is compared in constant time and the service refuses every request if `PRICING_KEY`
+  is not set. For apps on the same account a service binding is still the tighter option.
+- `/history` and `/medians` read all the rows with one query (per group of 80 items for `/medians`)
+  instead of one query per lookup or item: Cloudflare caps D1 queries per request (50 on the free plan).
 - Error messages are in Italian (the apps that call it are Italian); the code comments too.
+
+## Trying it locally
+`EBAY_BASE_URL` (normally unset) changes eBay's address: `https://api.sandbox.ebay.com` for eBay's sandbox,
+or a fake eBay on `http://localhost:…` to exercise the service without real credentials:
+```bash
+npx wrangler d1 execute pricing-db --local --file=schema.sql
+npx wrangler dev --var PRICING_KEY:k --var EBAY_CLIENT_ID:x --var EBAY_CLIENT_SECRET:y --var EBAY_BASE_URL:http://localhost:9090
+```
 
 ## Licence
 

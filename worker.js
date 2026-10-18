@@ -17,11 +17,32 @@
 //
 // Binding richiesto: DB (database D1, vedi wrangler.toml)
 
-const EBAY_OAUTH = 'https://api.ebay.com/identity/v1/oauth2/token';
-const EBAY_SEARCH = 'https://api.ebay.com/buy/browse/v1/item_summary/search';
+// L'indirizzo base di eBay si può cambiare con la variabile EBAY_BASE_URL (di norma assente):
+// serve per la sandbox di eBay (https://api.sandbox.ebay.com) e per provare il servizio in locale.
+const EBAY_BASE = 'https://api.ebay.com';
+const ebayOauth = (env) => `${env.EBAY_BASE_URL || EBAY_BASE}/identity/v1/oauth2/token`;
+const ebaySearch = (env) => `${env.EBAY_BASE_URL || EBAY_BASE}/buy/browse/v1/item_summary/search`;
 const EBAY_SCOPE = 'https://api.ebay.com/oauth/api_scope';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+// Confronto a tempo costante: i tempi di risposta non devono far dedurre la chiave
+function safeEq(a, b) {
+  a = String(a ?? ''); b = String(b ?? '');
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+// Body JSON malformato = 400 (prima finiva in un 500 con il messaggio dell'errore di parsing)
+async function readJson(request) {
+  try {
+    const b = await request.json();
+    return b && typeof b === 'object' ? b : {};
+  } catch { return null; }
+}
+const bad = (msg) => json({ error: msg }, 400);
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
@@ -39,7 +60,7 @@ async function getEbayToken(env) {
     grant_type: 'client_credentials',
     scope: EBAY_SCOPE,
   });
-  const res = await fetch(EBAY_OAUTH, {
+  const res = await fetch(ebayOauth(env), {
     method: 'POST',
     headers: {
       'Authorization': `Basic ${basic}`,
@@ -61,7 +82,7 @@ async function getEbayToken(env) {
 // ── eBay: ricerca inserzioni attive ────────────────────────────────────────────
 async function searchEbay(env, query, marketplace) {
   const token = await getEbayToken(env);
-  const url = new URL(EBAY_SEARCH);
+  const url = new URL(ebaySearch(env));
   url.searchParams.set('q', query);
   url.searchParams.set('filter', 'buyingOptions:{FIXED_PRICE|BEST_OFFER}');
   url.searchParams.set('limit', '50');
@@ -125,24 +146,31 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Auth: chiave condivisa (le app la mandano server-side)
-    if (request.headers.get('X-Pricing-Key') !== env.PRICING_KEY) {
+    // Auth: chiave condivisa (le app la mandano server-side).
+    // Senza PRICING_KEY configurata il servizio non risponde a nessuno (prima: 401 identico a una chiave sbagliata).
+    if (!env.PRICING_KEY) return json({ error: 'Servizio non configurato' }, 503);
+    if (!safeEq(request.headers.get('X-Pricing-Key'), env.PRICING_KEY)) {
       return json({ error: 'Non autorizzato' }, 401);
     }
 
     try {
       // POST /check
       if (request.method === 'POST' && path === '/check') {
-        const b = await request.json();
+        const b = await readJson(request);
+        if (!b) return bad('Body JSON non valido');
         const source = b.source;
         const item_id = b.item_id;
-        const query = (b.query || '').trim();
+        const query = String(b.query || '').trim();
         const marketplace = b.marketplace || 'EBAY_IT';
         const currency = 'EUR';
 
         if (!source || !item_id || !query) {
           return json({ error: 'source, item_id e query sono obbligatori' }, 400);
         }
+        // Limiti: finiscono nel database e nella richiesta a eBay, non devono poter essere enormi
+        if (String(source).length > 60 || String(item_id).length > 120) return bad('source o item_id troppo lunghi');
+        if (query.length > 300) return bad('query troppo lunga (max 300 caratteri)');
+        if (!/^EBAY_[A-Z]{2,3}$/.test(marketplace)) return bad('marketplace non valido (es. EBAY_IT)');
 
         const summaries = await searchEbay(env, query, marketplace);
         const listings = summaries.map(normalizeListing);
@@ -152,7 +180,7 @@ export default {
         const checkRes = await env.DB.prepare(
           `INSERT INTO price_check (source, item_id, query, marketplace, currency, result_count, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).bind(source, item_id, query, marketplace, currency, listings.length, now).run();
+        ).bind(String(source), String(item_id), query, marketplace, currency, listings.length, now).run();
         const checkId = checkRes.meta.last_row_id;
 
         // Salva le righe (batch)
@@ -162,10 +190,16 @@ export default {
                (check_id, ebay_item_id, title, price, shipping, total_price, condition_id, best_offer, seller_score, item_url)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           );
-          await env.DB.batch(listings.map(l => stmt.bind(
-            checkId, l.ebay_item_id, l.title, l.price, l.shipping,
-            l.total_price, l.condition_id, l.best_offer, l.seller_score, l.item_url
-          )));
+          try {
+            await env.DB.batch(listings.map(l => stmt.bind(
+              checkId, l.ebay_item_id, l.title, l.price, l.shipping,
+              l.total_price, l.condition_id, l.best_offer, l.seller_score, l.item_url
+            )));
+          } catch (e) {
+            // Senza le righe la check direbbe "N risultati" e non ne avrebbe nessuna: la tolgo
+            await env.DB.prepare(`DELETE FROM price_check WHERE id = ?`).bind(checkId).run().catch(() => {});
+            throw e;
+          }
         }
 
         // Rileggi le righe con il loro id (servono per il soft-delete lato UI)
@@ -195,20 +229,32 @@ export default {
              FROM price_check WHERE source = ? AND item_id = ? ORDER BY created_at DESC`
         ).bind(source, item_id).all();
 
-        const history = [];
-        for (const c of checks.results) {
-          const rows = await env.DB.prepare(
-            `SELECT id, ebay_item_id, title, total_price, condition_id, best_offer, item_url, deleted
-               FROM price_listing WHERE check_id = ?`
-          ).bind(c.id).all();
-          history.push({
+        /* Le righe di TUTTE le check dell'articolo in una sola query. Prima c'era una query per check:
+           con più di una cinquantina di ricerche sullo stesso articolo si superava il limite di
+           richieste a richiesta di Cloudflare (50 sul piano gratuito) e lo storico dava errore. */
+        const rowsByCheck = new Map();
+        if (checks.results.length) {
+          const all = await env.DB.prepare(
+            `SELECT l.id, l.check_id, l.ebay_item_id, l.title, l.total_price, l.condition_id, l.best_offer, l.item_url, l.deleted
+               FROM price_listing l JOIN price_check c ON c.id = l.check_id
+              WHERE c.source = ? AND c.item_id = ?
+              ORDER BY l.deleted, l.id`   // le escluse in fondo, come mostrava la query per singola check
+          ).bind(source, item_id).all();
+          for (const { check_id, ...row } of all.results) {
+            if (!rowsByCheck.has(check_id)) rowsByCheck.set(check_id, []);
+            rowsByCheck.get(check_id).push(row);
+          }
+        }
+        const history = checks.results.map(c => {
+          const rows = rowsByCheck.get(c.id) || [];
+          return {
             check_id: c.id,
             created_at: c.created_at,
             currency: c.currency,
-            stats: computeStats(rows.results),   // ricalcolata: rispetta i soft-delete
-            listings: rows.results,
-          });
-        }
+            stats: computeStats(rows),   // ricalcolata: rispetta i soft-delete
+            listings: rows,
+          };
+        });
         return json({ source, item_id, history });
       }
 
@@ -216,35 +262,44 @@ export default {
       // Ultima mediana conosciuta per ciascun item, senza interrogare eBay:
       // serve agli alert per confrontare il prezzo richiesto col mercato.
       if (request.method === 'POST' && path === '/medians') {
-        const b = await request.json();
+        const b = await readJson(request);
+        if (!b) return bad('Body JSON non valido');
         const source = b.source;
-        const ids = Array.isArray(b.item_ids) ? b.item_ids.filter(x => x != null).map(String) : [];
+        const ids = Array.isArray(b.item_ids) ? [...new Set(b.item_ids.filter(x => x != null).map(String))] : [];
         if (!source) return json({ error: 'source obbligatorio' }, 400);
         if (!ids.length) return json({ source, medians: {} });
 
         const medians = {};
-        // A chunk: SQLite ha un limite al numero di parametri per query
+        /* A gruppi di 80: D1 accetta al massimo 100 parametri per query. Per ogni gruppo bastano DUE
+           query (le check più recenti, poi le loro righe): prima ce n'era una per articolo, e con una
+           cinquantina di articoli già misurati la pagina Alert superava il limite di richieste. */
         for (let i = 0; i < ids.length; i += 80) {
           const chunk = ids.slice(i, i + 80);
           const ph = chunk.map(() => '?').join(',');
-          // Per ogni item prendiamo la check più recente
+          // Per ogni articolo la check più recente (a parità di istante, l'ultima inserita)
           const checks = await env.DB.prepare(
             `SELECT c.id, c.item_id, c.query, c.created_at
                FROM price_check c
               WHERE c.source = ? AND c.item_id IN (${ph})
-                AND c.created_at = (
-                  SELECT MAX(created_at) FROM price_check
+                AND c.id = (
+                  SELECT id FROM price_check
                    WHERE source = c.source AND item_id = c.item_id
+                   ORDER BY created_at DESC, id DESC LIMIT 1
                 )`
           ).bind(source, ...chunk).all();
+          if (!checks.results.length) continue;
 
+          const cph = checks.results.map(() => '?').join(',');
+          const rows = await env.DB.prepare(
+            `SELECT check_id, total_price, deleted FROM price_listing WHERE check_id IN (${cph})`
+          ).bind(...checks.results.map(c => c.id)).all();
+          const byCheck = new Map();
+          for (const r of rows.results) {
+            if (!byCheck.has(r.check_id)) byCheck.set(r.check_id, []);
+            byCheck.get(r.check_id).push(r);
+          }
           for (const c of checks.results) {
-            // se ci sono due check con lo stesso timestamp tengo la prima
-            if (medians[c.item_id]) continue;
-            const rows = await env.DB.prepare(
-              `SELECT total_price, deleted FROM price_listing WHERE check_id = ?`
-            ).bind(c.id).all();
-            const st = computeStats(rows.results);
+            const st = computeStats(byCheck.get(c.id) || []);
             medians[c.item_id] = {
               check_id: c.id, query: c.query, created_at: c.created_at,
               count: st.count, min: st.min, median: st.median, max: st.max,
